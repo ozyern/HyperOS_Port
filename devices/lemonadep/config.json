@@ -1,0 +1,39 @@
+{
+  "device": {
+    "codename":       "lemonadep",
+    "model":          "OnePlus 9 Pro",
+    "brand":          "OnePlus",
+    "manufacturer":   "OnePlus",
+    "soc":            "lahaina",
+    "soc_manufacturer": "Qualcomm",
+    "dpi":            525,
+    "cpu_abi":        "arm64-v8a",
+    "cpu_abi2":       "armeabi-v7a",
+    "display_id":     "display_id_0",
+    "display_refresh": 120,
+    "display_min_refresh": 1,
+    "display_type":   "LTPO",
+    "has_nfc":        true,
+    "has_fod":        true,
+    "fod_vendor":     "goodix",
+    "has_alert_slider": true,
+    "charging_max_w": 65,
+    "wireless_charging_max_w": 50,
+    "kernel_version": "4.19",
+    "vndk_version":   34,
+    "board_api_level": 34,
+    "target_api":     36,
+    "android_version": 16,
+    "partitions": ["system","system_ext","product","vendor","odm"]
+  },
+  "port": {
+    "fs_type":      "erofs",
+    "pack_type":    "fastboot",
+    "ksu":          false,
+    "selinux_permissive_first_boot": true
+  },
+  "maintainer": {
+    "name":   "Ozyern",
+    "github": "https://github.com/ozyern"
+  }
+}
