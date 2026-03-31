@@ -5,7 +5,7 @@
 #
 #   baserom   — OxygenOS 14 for lemonadep (path or URL)
 #   portrom   — HyperOS ROM from SM8350/SM8450/SM8550 device (path or URL)
-#   anykernel — optional AnyKernel3 zip to inject custom kernel
+#   anykernel — (optional) AnyKernel3 zip to inject a custom kernel
 #
 # Both ROM paths accept direct download URLs.
 # Must be run as root (required for loop mounts).
