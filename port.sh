@@ -59,6 +59,9 @@ step "PHASE 1 — Extract ROMs"
 extract_rom "$SOURCE_ROM_ZIP" "$SOURCE_DUMP" "HyperOS"
 extract_rom "$BASE_ROM_ZIP"   "$BASE_DUMP"   "OxygenOS"
 
+# Validate source architecture BEFORE doing any work
+validate_source_arch "$SOURCE_DUMP"
+
 # Verify expected partitions exist
 for part in "${HYPEROS_PARTITIONS[@]}"; do
     [[ -f "$SOURCE_DUMP/${part}.img" ]] || \

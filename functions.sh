@@ -19,7 +19,72 @@ step()    { echo -e "\n${BOLD}${CYAN}━━ $* ━━${RESET}"; }
 # ── Error trap ────────────────────────────────────────────────────────────────
 trap 'die "Script failed at line $LINENO — command: $BASH_COMMAND"' ERR
 
-# ── Tool verification ─────────────────────────────────────────────────────────
+# ── SoC / architecture validation ────────────────────────────────────────────
+# Call this before doing any merge work.
+# Reads source build.prop to detect SoC, cross-checks SOC_ARCH table,
+# and hard-blocks pure-64-bit sources.
+validate_source_arch() {
+    local source_dump="$1"
+    local build_prop
+    build_prop=$(find "$source_dump" -name "build.prop" | head -1 || true)
+    [[ -z "$build_prop" ]] && die "Cannot find build.prop in source dump"
+
+    # Try to read SoC from props (Qualcomm sets ro.board.platform or ro.hardware)
+    local soc_platform
+    soc_platform=$(grep -E "^ro\.board\.platform=|^ro\.soc\.model=" "$build_prop" \
+                   | cut -d= -f2 | head -1 | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]') || true
+
+    # Also try codename-based lookup from config
+    local source_codename
+    source_codename=$(grep "^ro\.product\.device=" "$build_prop" | cut -d= -f2 | tr -d '[:space:]') || true
+
+    local soc_id=""
+    # Try codename table first (most reliable)
+    if [[ -n "${source_codename:-}" && -n "${DEVICE_SOC[$source_codename]+_}" ]]; then
+        soc_id="${DEVICE_SOC[$source_codename]}"
+        log "Detected source device: $source_codename → SoC: $soc_id"
+    fi
+
+    # Fallback: match platform string against known SM IDs
+    if [[ -z "$soc_id" ]]; then
+        for sm in "${!SOC_ARCH[@]}"; do
+            if echo "$soc_platform" | grep -qi "$sm"; then
+                soc_id="$sm"; break
+            fi
+        done
+    fi
+
+    if [[ -z "$soc_id" ]]; then
+        warn "Unknown source SoC (platform='$soc_platform', device='$source_codename')"
+        warn "Could not verify arm32 compatibility — proceeding, but check lib/ dirs manually"
+        return
+    fi
+
+    local arch="${SOC_ARCH[$soc_id]:-unknown}"
+    if [[ "$arch" == "pure64" ]]; then
+        die "Source SoC $soc_id is PURE 64-BIT (${source_codename:-unknown}).
+     This ROM has no arm32 compat layer — porting to SM8350 will break:
+       • All 32-bit apps (most older/game apps)
+       • System services that ship 32-bit variants
+       • lib/ directories will be missing entirely
+     Use a source device with SM8350 / SM8450 / SM8550 instead."
+    fi
+
+    success "Source SoC $soc_id ($arch) — arm32 compat confirmed ✓"
+
+    # Sanity-check: lib/ (32-bit) dirs should exist in system
+    local lib32_count
+    lib32_count=$(find "$source_dump" -maxdepth 4 -path "*/system/lib/*.so" 2>/dev/null | wc -l) || true
+    if [[ "$lib32_count" -lt 10 ]]; then
+        warn "Very few 32-bit libs found in source (count=$lib32_count)."
+        warn "This ROM may already be shipping minimal arm32 support."
+        warn "Check /system/lib/ manually before flashing."
+    else
+        log "32-bit lib sanity check: $lib32_count libs found ✓"
+    fi
+}
+
+
 check_tools() {
     local missing=()
     for tool in "${TOOLS_REQUIRED[@]}"; do
