@@ -58,7 +58,7 @@ check_all_tools() {
         fi
     done
     # Optional but preferred
-    for t in magiskboot fsck.erofs mkfs.erofs debugfs e2fsck; do
+    for t in magiskboot fsck.erofs mkfs.erofs debugfs e2fsck brotli 7z lpdump; do
         if command -v "$t" &>/dev/null; then
             log_ok "  $t → $(command -v "$t")"
         else

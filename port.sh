@@ -47,9 +47,11 @@ HYPEROS_WORK="${WORK_DIR}/hyperos_extracted"
 OOS_WORK="${WORK_DIR}/oos_extracted"
 PORT_DIR="${WORK_DIR}/port"
 FLASHABLE_DIR="${OUT_DIR}/flashable"
+FASTBOOT_DIR="${OUT_DIR}/fastboot_rom"
+FASTBOOT_IMG_DIR="${FASTBOOT_DIR}/images"
 DATE_TAG=$(date +%Y%m%d_%H%M)
 
-mkdir -p "$OUT_DIR" "$WORK_DIR" "$HYPEROS_WORK" "$OOS_WORK" "$PORT_DIR" "$FLASHABLE_DIR"
+mkdir -p "$OUT_DIR" "$WORK_DIR" "$HYPEROS_WORK" "$OOS_WORK" "$PORT_DIR" "$FLASHABLE_DIR" "$FASTBOOT_IMG_DIR"
 
 LOG_FILE="${OUT_DIR}/port_${DATE_TAG}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -63,8 +65,16 @@ is_wsl && log_warn "Running in WSL — mount-based extraction disabled (using us
 # ──────────────────────────── Step 1: Check tools ────────────────────────────
 check_all_tools
 
+# Extra sanity: refuse delta OTAs early (payload_properties with SOURCE_*)
+if unzip -p "$HYPEROS_ZIP" payload_properties.txt 2>/dev/null | grep -q "SOURCE_"; then
+    die "HyperOS ZIP appears to be an incremental OTA (payload_properties contains SOURCE_*). Use a full OTA."
+fi
+if unzip -p "$OOS_ZIP" payload_properties.txt 2>/dev/null | grep -q "SOURCE_"; then
+    die "OOS14 ZIP appears to be an incremental OTA (payload_properties contains SOURCE_*). Use a full OTA."
+fi
+
 # ──────────────────────────── Step 2: Extract ROMs ───────────────────────────
-log_step "Step 2/9 — Extracting ROMs"
+log_step "Step 2/10 — Extracting ROMs"
 
 if [[ -d "${HYPEROS_WORK}/system" ]] && [[ "$(ls "${HYPEROS_WORK}" | wc -l)" -gt 2 ]]; then
     log_warn "  HyperOS already extracted — skipping (delete ${HYPEROS_WORK} to re-extract)"
@@ -81,7 +91,7 @@ else
 fi
 
 # ──────────────────────────── Step 3: Extract partition images ───────────────
-log_step "Step 3/9 — Extracting partition images into filesystems"
+log_step "Step 3/10 — Extracting partition images into filesystems"
 
 PARTITIONS_HYPEROS=(system system_ext product)
 PARTITIONS_OOS=(vendor odm)
@@ -151,8 +161,8 @@ for img_name in boot init_boot vendor_boot; do
         log_info "  Saved ${img_name}.img from OOS14"
 done
 
-# ──────────────────────────── Step 4-13: Apply patches ───────────────────────
-log_step "Step 4/9 — Applying device patches"
+# ──────────────────────────── Step 4-10: Apply patches ───────────────────────
+log_step "Step 4/10 — Applying device patches"
 
 # Temporarily relax strict exit so individual patch failures don't abort the port
 set +e
@@ -161,7 +171,7 @@ run_all_patches "$PORT_DIR" "$OOS_VENDOR_DIR"
 set -e
 
 # ──────────────────────────── Step 5: Patch boot image ───────────────────────
-log_step "Step 5/9 — Patching boot image"
+log_step "Step 5/10 — Patching boot image"
 
 BOOT_IMG="${PORT_DIR}/boot.img"
 INIT_BOOT_IMG="${PORT_DIR}/init_boot.img"
@@ -187,32 +197,114 @@ else
     log_warn "  magiskboot not found — boot.img copied as-is"
 fi
 
-[[ -f "$INIT_BOOT_IMG" ]] && cp "$INIT_BOOT_IMG" "${FLASHABLE_DIR}/init_boot.img"
+if [[ "${KSU:-0}" == "1" ]]; then
+    log_warn "  KSU=1 requested but KernelSU injection is not wired in this porter yet (skipping)"
+fi
+
+[[ -f "${FLASHABLE_DIR}/boot.img" ]] && cp "${FLASHABLE_DIR}/boot.img" "${FASTBOOT_IMG_DIR}/boot.img"
+[[ -f "$INIT_BOOT_IMG" ]] && { cp "$INIT_BOOT_IMG" "${FLASHABLE_DIR}/init_boot.img"; cp "$INIT_BOOT_IMG" "${FASTBOOT_IMG_DIR}/init_boot.img"; }
 
 # ──────────────────────────── Step 6: Repack images ─────────────────────────
-log_step "Step 6/9 — Repacking partition images"
+log_step "Step 6/10 — Repacking partition images"
 
-FS_TYPE="erofs"   # Android 16 uses erofs
+# Use original filesystem type when possible; fallback to erofs
 for part in system system_ext product vendor odm; do
     src="${PORT_DIR}/${part}"
     out_img="${FLASHABLE_DIR}/${part}.img"
     [[ -d "$src" ]] || { log_warn "  Skipping $part (dir missing)"; continue; }
-    repack_img "$src" "$out_img" "$FS_TYPE" "$part" || log_warn "  $part repack failed"
+
+    # Detect filesystem from source image (HyperOS for system*, OOS for vendor/odm)
+    orig_img=""
+    if [[ "$part" == "system" || "$part" == "system_ext" || "$part" == "product" ]]; then
+        orig_img=$(find "$HYPEROS_WORK" -name "${part}.img" 2>/dev/null | head -1)
+    else
+        orig_img=$(find "$OOS_WORK" -name "${part}.img" 2>/dev/null | head -1)
+    fi
+
+    fs_type="erofs"
+    [[ -f "$orig_img" ]] && fs_type=$(detect_fs "$orig_img")
+    [[ "$fs_type" == "unknown" ]] && fs_type="erofs"
+
+    repack_img "$src" "$out_img" "$fs_type" "$part" || log_warn "  $part repack failed"
+    cp -f "$out_img" "${FASTBOOT_IMG_DIR}/${part}.img" 2>/dev/null || true
 done
 
+# ──────────────────────────── Step 6b: Super size guard (best-effort) ───────
+if command -v lpdump &>/dev/null; then
+    SUPER_IMG=""
+    SUPER_IMG=$(find "$HYPEROS_WORK" "$OOS_WORK" -maxdepth 2 -name "super.img" 2>/dev/null | head -1)
+    if [[ -n "$SUPER_IMG" ]]; then
+        log_step "Step 6b — Checking super partition capacity"
+        python3 - "$SUPER_IMG" "$FASTBOOT_IMG_DIR" << 'PY'
+import json, subprocess, sys, os
+super_img, imgs_dir = sys.argv[1], sys.argv[2]
+
+def run(cmd):
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        return out
+    except Exception:
+        return b""
+
+meta = run(["lpdump", "-j", super_img])
+if not meta:
+    print("[WARN] lpdump could not parse super.img — skipping size guard")
+    sys.exit(0)
+
+try:
+    data = json.loads(meta)
+except Exception:
+    print("[WARN] lpdump JSON parse failed — skipping size guard")
+    sys.exit(0)
+
+groups = data.get("groups", [])
+if not groups:
+    print("[WARN] No groups in lpdump — skipping size guard")
+    sys.exit(0)
+
+budget = max((g.get("maximum_size", 0) for g in groups), default=0)
+if budget <= 0:
+    print("[WARN] No usable group size — skipping size guard")
+    sys.exit(0)
+
+need = 0
+for part in ("system","system_ext","product","vendor","odm"):
+    p = os.path.join(imgs_dir, f"{part}.img")
+    if os.path.isfile(p):
+        need += os.path.getsize(p)
+
+if need == 0:
+    print("[WARN] No partition images found for size check")
+    sys.exit(0)
+
+ratio = need / budget if budget else 0
+print(f"[INFO] Super size guard: need={need/1_048_576:.1f} MiB, budget={budget/1_048_576:.1f} MiB, usage={ratio*100:.1f}%")
+if ratio > 0.98:
+    print("[ERR] Repacked images exceed super group capacity. Consider trimming or switching pack type.")
+    sys.exit(1)
+elif ratio > 0.92:
+    print("[WARN] Repacked images are close to super capacity (>92%). Flash may fail if partitions expand further.")
+PY
+        if [[ $? -ne 0 ]]; then
+            die "Super size check failed — images likely too large for dynamic partitions"
+        fi
+    fi
+fi
+
 # ──────────────────────────── Step 7: Copy other images ──────────────────────
-log_step "Step 7/9 — Copying remaining images"
+log_step "Step 7/10 — Copying remaining images"
 
 for img_name in vendor_boot dtbo vbmeta vbmeta_system; do
     src=$(find "$OOS_WORK" -name "${img_name}.img" 2>/dev/null | head -1)
     if [[ -n "$src" ]]; then
         cp -f "$src" "${FLASHABLE_DIR}/${img_name}.img"
+        cp -f "$src" "${FASTBOOT_IMG_DIR}/${img_name}.img"
         log_ok "  Copied ${img_name}.img from OOS14"
     fi
 done
 
-# ──────────────────────────── Step 8: Write flash_auto.sh ────────────────────
-log_step "Step 8/9 — Generating flash_auto.sh"
+# ──────────────────────────── Step 8: Write flash scripts ────────────────────
+log_step "Step 8/10 — Generating flash scripts"
 
 cat > "${FLASHABLE_DIR}/flash_auto.sh" << 'FLASH'
 #!/usr/bin/env bash
@@ -356,12 +448,123 @@ FLASH
 chmod +x "${FLASHABLE_DIR}/flash_auto.sh"
 log_ok "flash_auto.sh generated"
 
-# ──────────────────────────── Step 9: Package output ────────────────────────
-log_step "Step 9/9 — Packaging output"
+cat > "${FASTBOOT_DIR}/flash_fastboot.sh" << 'FAST'
+#!/usr/bin/env bash
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+log()  { echo -e "${CYAN}[fastboot]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
+
+IMAGES_DIR="$(cd "$(dirname "$0")" && pwd)/images"
+FB="${FB:-fastboot}"
+SLOT="${SLOT:-a}"
+
+[[ "$SLOT" == "a" || "$SLOT" == "b" ]] || die "Invalid slot: $SLOT"
+
+log "Flashing HyperOS 3 fastboot ROM → slot _${SLOT}"
+$FB devices | grep -q "fastboot" || die "No device detected in fastboot mode"
+
+log "Disabling AVB and flashing vbmeta"
+for part in vbmeta vbmeta_system; do
+    img="${IMAGES_DIR}/${part}.img"
+    [[ -f "$img" ]] || continue
+    $FB --disable-verity --disable-verification flash "${part}_${SLOT}" "$img" || warn "${part} flash returned non-zero"
+done
+
+log "Rebooting to fastbootd"
+$FB reboot fastboot
+sleep 6
+
+log "Flashing logical partitions"
+for part in system system_ext product vendor odm; do
+    img="${IMAGES_DIR}/${part}.img"
+    [[ -f "$img" ]] || { warn "  ${part}.img missing"; continue; }
+    size=$(wc -c < "$img")
+    $FB delete-logical-partition "${part}_a" 2>/dev/null || true
+    $FB delete-logical-partition "${part}_b" 2>/dev/null || true
+    $FB create-logical-partition "${part}_${SLOT}" "$size" 2>/dev/null || true
+    $FB flash "${part}_${SLOT}" "$img"
+done
+
+log "Flashing bootable partitions"
+for part in boot init_boot vendor_boot dtbo; do
+    img="${IMAGES_DIR}/${part}.img"
+    [[ -f "$img" ]] || continue
+    $FB flash "${part}_${SLOT}" "$img"
+done
+
+log "Setting active slot"
+$FB set_active "$SLOT"
+ok "Flashing complete — rebooting"
+$FB reboot
+FAST
+chmod +x "${FASTBOOT_DIR}/flash_fastboot.sh"
+
+cat > "${FASTBOOT_DIR}/flash_fastboot.bat" << 'BAT'
+@echo off
+setlocal
+set FB=fastboot
+set SLOT=a
+if not "%1"=="" set SLOT=%1
+set IMAGES=%~dp0images
+
+echo HyperOS 3 fastboot flash (slot _%SLOT%)
+%FB% devices | find "fastboot" >NUL || (
+  echo No device detected in fastboot mode
+  exit /b 1
+)
+
+echo Disabling AVB and flashing vbmeta
+if exist "%IMAGES%\vbmeta.img" %FB% --disable-verity --disable-verification flash vbmeta_%SLOT% "%IMAGES%\vbmeta.img"
+if exist "%IMAGES%\vbmeta_system.img" %FB% --disable-verity --disable-verification flash vbmeta_system_%SLOT% "%IMAGES%\vbmeta_system.img"
+
+echo Rebooting to fastbootd
+%FB% reboot fastboot
+timeout /t 6 >nul
+
+echo Flashing logical partitions
+for %%p in (system system_ext product vendor odm) do (
+  if exist "%IMAGES%\%%p.img" (
+    %FB% delete-logical-partition %%p_a 2>nul
+    %FB% delete-logical-partition %%p_b 2>nul
+    for /f %%s in ('powershell -nologo -command "(Get-Item \"%IMAGES%\\%%p.img\").Length"') do set SIZE=%%s
+    %FB% create-logical-partition %%p_%SLOT% %SIZE% 2>nul
+    %FB% flash %%p_%SLOT% "%IMAGES%\%%p.img"
+  ) else (
+    echo Skipping %%p.img (missing)
+  )
+)
+
+echo Flashing bootable partitions
+for %%p in (boot init_boot vendor_boot dtbo) do (
+  if exist "%IMAGES%\%%p.img" %FB% flash %%p_%SLOT% "%IMAGES%\%%p.img"
+)
+
+echo Setting active slot
+%FB% set_active %SLOT%
+echo Done. Rebooting...
+%FB% reboot
+BAT
+
+log_ok "flash_fastboot.sh and flash_fastboot.bat generated"
+
+# ──────────────────────────── Step 9: Prepare fastboot ROM dir ───────────────
+log_step "Step 9/10 — Preparing fastboot ROM layout"
+cp -af "${FLASHABLE_DIR}"/*.img "${FASTBOOT_IMG_DIR}/" 2>/dev/null || true
+log_ok "Fastboot ROM ready at ${FASTBOOT_DIR}"
+
+# ──────────────────────────── Step 10: Package output ───────────────────────
+log_step "Step 10/10 — Packaging output"
 
 OUTPUT_ZIP="${OUT_DIR}/HyperOS3_OOS14_lemonadep_by_Ozyern_${DATE_TAG}.zip"
+FASTBOOT_ZIP="${OUT_DIR}/HyperOS3_OOS14_lemonadep_fastboot_${DATE_TAG}.zip"
 ( cd "$FLASHABLE_DIR" && zip -r9 "$OUTPUT_ZIP" . ) && \
     log_ok "Output ZIP: $OUTPUT_ZIP ($(du -sh "$OUTPUT_ZIP" | cut -f1))"
+( cd "$FASTBOOT_DIR" && zip -r9 "$FASTBOOT_ZIP" . ) && \
+    log_ok "Fastboot ZIP: $FASTBOOT_ZIP ($(du -sh "$FASTBOOT_ZIP" | cut -f1))"
 
 # ──────────────────────────── Porting notes ──────────────────────────────────
 cat > "${OUT_DIR}/PORTING_NOTES.md" << MD
@@ -416,6 +619,7 @@ echo -e "${GREEN}${BOLD}  PORT COMPLETE — Time: $(elapsed)${NC}"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
 echo ""
 echo -e "  Output ZIP : ${BOLD}$OUTPUT_ZIP${NC}"
+echo -e "  Fastboot   : ${BOLD}$FASTBOOT_ZIP${NC}"
 echo -e "  Flash log  : ${BOLD}$LOG_FILE${NC}"
 echo -e "  Notes      : ${BOLD}${OUT_DIR}/PORTING_NOTES.md${NC}"
 echo ""
