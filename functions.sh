@@ -143,11 +143,32 @@ detect_partitions() {
 
 # ── Partition mounting ────────────────────────────────────────────────────────
 mount_partition() {
-    local img="$1" mntpoint="$2"
+    local img="$1" mntpoint="$2" orig="$1"
     mkdir -p "$mntpoint"
-    if file "$img" | grep -q "Android sparse"; then
+    local ftype
+    ftype=$(file -b "$img")
+    if echo "$ftype" | grep -q "erofs"; then
+        # Convert erofs → ext4 for writable patching
+        local tmpdir; tmpdir=$(mktemp -d)
+        fsck.erofs --extract="$tmpdir" "$img" >/dev/null 2>&1 || die "Failed to extract erofs: $img"
+        local size_bytes; size_bytes=$(du -sb "$tmpdir" | awk '{print $1}')
+        local size_ext=$((size_bytes + 512*1024*1024)) # add 512MB headroom
+        local ext_img="${img%.img}_ext4.img"
+        dd if=/dev/zero of="$ext_img" bs=1 count=0 seek="$size_ext" 2>/dev/null
+        mkfs.ext4 -F "$ext_img" >/dev/null 2>&1 || die "mkfs.ext4 failed for $img"
+        mount -o loop,rw "$ext_img" "$mntpoint" || die "Failed to mount $ext_img"
+        cp -a --preserve=all "$tmpdir/." "$mntpoint/"
+        umount "$mntpoint" || true
+        rm -rf "$tmpdir"
+        mv -f "$ext_img" "$orig"
+        img="$orig"
+        ftype=$(file -b "$img")
+    fi
+    if echo "$ftype" | grep -q "Android sparse"; then
         local raw="${img%.img}_raw.img"
-        simg2img "$img" "$raw"; img="$raw"
+        simg2img "$img" "$raw"
+        mv -f "$raw" "$orig"
+        img="$orig"
     fi
     e2fsck -fy "$img" 2>/dev/null || true
     resize2fs "$img" 2>/dev/null || true

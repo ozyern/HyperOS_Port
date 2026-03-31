@@ -110,6 +110,17 @@ for img in "${BASE_BOOT_IMAGES[@]}"; do
     fi
 done
 
+# vbmeta family (AVB). Not strictly required but improves boot success.
+for img in vbmeta vbmeta_system; do
+    src="$BASE_DUMP/${img}.img"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$MERGED/${img}.img"
+        success "  ✓ ${img}.img"
+    else
+        warn "  - ${img}.img (not found — AVB may block boot if not flashed)"
+    fi
+done
+
 # Optional: custom kernel injection
 if [[ -n "$CUSTOM_KERNEL" ]]; then
     inject_anykernel "$CUSTOM_KERNEL" "$MERGED/boot.img"
@@ -163,7 +174,7 @@ pack_super "$MERGED" "$OUT"
 step "PHASE 10 — Build flashable zip"
 # ═════════════════════════════════════════════════════════════════════════════
 
-for img in "${BASE_BOOT_IMAGES[@]}"; do
+for img in "${BASE_BOOT_IMAGES[@]}" vbmeta vbmeta_system; do
     [[ -f "$MERGED/${img}.img" ]] && cp "$MERGED/${img}.img" "$OUT/" || true
 done
 
@@ -179,6 +190,9 @@ echo -e "  Zip:    ${CYAN}HyperOS_Port_lemonadep_${VERSION}.zip${RESET}"
 echo ""
 echo -e "${YELLOW}Flash via fastboot:${RESET}"
 echo "  adb reboot fastboot"
+echo "  fastboot --disable-verity --disable-verification flash vbmeta         output/vbmeta.img"
+echo "  fastboot --disable-verity --disable-verification flash vbmeta_system  output/vbmeta_system.img"
+echo "  fastboot reboot fastboot    # enter fastbootd for logical partitions"
 echo "  fastboot flash super        output/super.img"
 echo "  fastboot flash boot         output/boot.img"
 echo "  fastboot flash vendor_boot  output/vendor_boot.img"

@@ -108,6 +108,8 @@ TOOLS_REQUIRED=(
     simg2img
     resize2fs
     e2fsck
+    fsck.erofs
+    mkfs.ext4
     python3
     7z
     xmlstarlet
