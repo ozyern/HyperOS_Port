@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
 # HyperOS_Port — port.sh
-# Main orchestrator: HyperOS source + OxygenOS vendor → OnePlus 9 Pro ROM
+# Usage: sudo ./port.sh <baserom> <portrom> [anykernel.zip]
 #
-# Usage:
-#   SOURCE_ROM_ZIP=/path/to/hyperos_alioth.zip \
-#   BASE_ROM_ZIP=/path/to/oxygenos14_lemonadep.zip \
-#   sudo ./port.sh
+#   baserom   — OxygenOS 14 for lemonadep (path or URL)
+#   portrom   — HyperOS ROM from SM8350/SM8450/SM8550 device (path or URL)
+#   anykernel — optional AnyKernel3 zip to inject custom kernel
 #
-# Requirements: payload_dumper, lpunpack, lpmake, img2simg, simg2img,
-#               resize2fs, e2fsck, 7z, python3, xmlstarlet, zip
-# Must be run as root (for loop mounts)
+# Both ROM paths accept direct download URLs.
+# Must be run as root (required for loop mounts).
 # =============================================================================
 
 set -euo pipefail
@@ -20,154 +18,171 @@ source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/functions.sh"
 source "$SCRIPT_DIR/patches.sh"
 
-# ── Validate environment ──────────────────────────────────────────────────────
-[[ "$EUID" -eq 0 ]] || die "Must run as root (required for loop mounts)"
-[[ -n "${SOURCE_ROM_ZIP:-}" ]] || die "SOURCE_ROM_ZIP not set"
-[[ -n "${BASE_ROM_ZIP:-}"   ]] || die "BASE_ROM_ZIP not set"
-[[ -f "$SOURCE_ROM_ZIP"     ]] || die "Source ROM not found: $SOURCE_ROM_ZIP"
-[[ -f "$BASE_ROM_ZIP"       ]] || die "Base ROM not found: $BASE_ROM_ZIP"
+# ── Banner ────────────────────────────────────────────────────────────────────
+echo -e "${BOLD}${CYAN}"
+cat << 'BANNER'
+  ╔═══════════════════════════════════════════╗
+  ║          H y p e r O S _ P o r t         ║
+  ║   OnePlus 9 Pro (lemonadep / SM8350)      ║
+  ╚═══════════════════════════════════════════╝
+BANNER
+echo -e "${RESET}"
 
-check_tools
+# ── Args ──────────────────────────────────────────────────────────────────────
+[[ "$EUID" -eq 0 ]]  || die "Run as root (sudo ./port.sh)"
+[[ $# -ge 2 ]]       || die "Usage: sudo ./port.sh <baserom> <portrom> [anykernel.zip]"
 
-# ── Workspace setup ───────────────────────────────────────────────────────────
+BASE_ROM_INPUT="$1"
+PORT_ROM_INPUT="$2"
+CUSTOM_KERNEL="${3:-}"
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
 WORK="$SCRIPT_DIR/workdir"
-SOURCE_DUMP="$WORK/source_dump"   # HyperOS extracted partitions
-BASE_DUMP="$WORK/base_dump"       # OxygenOS extracted partitions
-MERGED="$WORK/merged"             # Working merged images
-MNT="$WORK/mnt"                   # Mount points
-OUT="$SCRIPT_DIR/output"          # Final output
+SOURCE_DUMP="$WORK/portrom_dump"
+BASE_DUMP="$WORK/baserom_dump"
+MERGED="$WORK/merged"
+MNT="$WORK/mnt"
+OUT="$SCRIPT_DIR/output"
 
 rm -rf "$WORK"
 mkdir -p "$SOURCE_DUMP" "$BASE_DUMP" "$MERGED" "$OUT"
 mkdir -p "$MNT"/{system,system_ext,product,odm_dlkm,vendor,odm}
 
-VERSION=$(date +%Y%m%d)
-
-# ── Cleanup trap ──────────────────────────────────────────────────────────────
 cleanup() {
-    log "Cleaning up mount points…"
     for mnt in "$MNT"/*; do
-        mountpoint -q "$mnt" && umount "$mnt" 2>/dev/null || true
+        mountpoint -q "$mnt" 2>/dev/null && umount "$mnt" || true
     done
 }
 trap cleanup EXIT
 
+check_tools
+
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 1 — Extract ROMs"
+step "PHASE 1 — Resolve & extract ROMs"
 # ═════════════════════════════════════════════════════════════════════════════
 
-extract_rom "$SOURCE_ROM_ZIP" "$SOURCE_DUMP" "HyperOS"
-extract_rom "$BASE_ROM_ZIP"   "$BASE_DUMP"   "OxygenOS"
+BASE_ROM=$(resolve_rom "$BASE_ROM_INPUT" "OxygenOS" "$WORK/downloads")
+PORT_ROM=$(resolve_rom "$PORT_ROM_INPUT" "HyperOS"  "$WORK/downloads")
 
-# Validate source architecture BEFORE doing any work
+extract_rom "$PORT_ROM" "$SOURCE_DUMP" "HyperOS"
+extract_rom "$BASE_ROM" "$BASE_DUMP"   "OxygenOS"
+
+# ═════════════════════════════════════════════════════════════════════════════
+step "PHASE 2 — Validate source architecture"
+# ═════════════════════════════════════════════════════════════════════════════
+
 validate_source_arch "$SOURCE_DUMP"
 
-# Verify expected partitions exist
-for part in "${HYPEROS_PARTITIONS[@]}"; do
-    [[ -f "$SOURCE_DUMP/${part}.img" ]] || \
-        die "Missing HyperOS partition: ${part}.img (check SOURCE_DEVICE compatibility)"
-done
-for part in "${BASE_PARTITIONS[@]}"; do
-    [[ -f "$BASE_DUMP/${part}.img" ]] || \
-        die "Missing OxygenOS partition: ${part}.img"
-done
-
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 2 — Prepare partition images"
+step "PHASE 3 — Prepare partition images"
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Copy HyperOS partitions → workdir
-log "Preparing HyperOS partitions"
-for part in "${HYPEROS_PARTITIONS[@]}"; do
-    cp "$SOURCE_DUMP/${part}.img" "$MERGED/${part}.img"
+log "Staging HyperOS partitions (skipping missing ones)…"
+for part in "${PORTROM_PARTITIONS[@]}"; do
+    src="$SOURCE_DUMP/${part}.img"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$MERGED/${part}.img"
+        success "  ✓ $part"
+    else
+        warn "  - $part (not found in source — skipping)"
+    fi
 done
 
-# Copy OxygenOS vendor partitions → workdir
-log "Preparing OxygenOS vendor partitions"
-for part in "${BASE_PARTITIONS[@]}"; do
-    cp "$BASE_DUMP/${part}.img" "$MERGED/${part}.img"
+log "Staging OxygenOS vendor partitions…"
+for part in "${BASEROM_PARTITIONS[@]}"; do
+    src="$BASE_DUMP/${part}.img"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$MERGED/${part}.img"
+        success "  ✓ $part (from OxygenOS)"
+    else
+        warn "  - $part (not in base ROM)"
+    fi
 done
 
-# Boot images always from OxygenOS (kernel + vendor_boot must match hardware)
-log "Using OxygenOS boot images (kernel must match hardware)"
+log "Staging boot images from OxygenOS…"
 for img in "${BASE_BOOT_IMAGES[@]}"; do
     src="$BASE_DUMP/${img}.img"
     if [[ -f "$src" ]]; then
         cp "$src" "$MERGED/${img}.img"
-        success "Boot image: ${img}.img from OxygenOS base"
+        success "  ✓ ${img}.img"
     else
-        warn "Boot image not found: ${img}.img — flash manually"
+        warn "  - ${img}.img (not found — flash manually)"
     fi
 done
 
+# Optional: custom kernel injection
+if [[ -n "$CUSTOM_KERNEL" ]]; then
+    inject_anykernel "$CUSTOM_KERNEL" "$MERGED/boot.img"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 3 — Mount partitions"
+step "PHASE 4 — Mount partitions"
 # ═════════════════════════════════════════════════════════════════════════════
 
-for part in "${HYPEROS_PARTITIONS[@]}" "${BASE_PARTITIONS[@]}"; do
-    mount_partition "$MERGED/${part}.img" "$MNT/$part"
+for part in system system_ext product odm_dlkm vendor odm; do
+    [[ -f "$MERGED/${part}.img" ]] && mount_partition "$MERGED/${part}.img" "$MNT/$part"
 done
 
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 4 — HyperOS cleanup & mi_ext merge"
+step "PHASE 5 — HyperOS cleanup"
 # ═════════════════════════════════════════════════════════════════════════════
 
 remove_hyperos_junk "$MNT"
 handle_mi_ext "$SOURCE_DUMP" "$MNT/system_ext"
 
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 5 — Apply patches"
+step "PHASE 6 — Apply patches"
 # ═════════════════════════════════════════════════════════════════════════════
 
 apply_all_patches "$WORK"
-install_compat_shims "$MNT/system"
 
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 6 — Unmount & finalise images"
+step "PHASE 7 — Apply device overlay"
 # ═════════════════════════════════════════════════════════════════════════════
 
-log "Unmounting partitions"
-for part in "${HYPEROS_PARTITIONS[@]}" "${BASE_PARTITIONS[@]}"; do
-    unmount_partition "$MNT/$part"
+apply_overlay "$MNT"
+
+# ═════════════════════════════════════════════════════════════════════════════
+step "PHASE 8 — Unmount & finalise"
+# ═════════════════════════════════════════════════════════════════════════════
+
+for part in system system_ext product odm_dlkm vendor odm; do
+    mountpoint -q "$MNT/$part" 2>/dev/null && unmount_partition "$MNT/$part" || true
+done
+for part in system system_ext product odm_dlkm vendor odm; do
+    [[ -f "$MERGED/${part}.img" ]] && { e2fsck -fy "$MERGED/${part}.img" 2>/dev/null || true; }
 done
 
-# Run e2fsck on all modified images
-log "Running e2fsck on merged images"
-for part in "${HYPEROS_PARTITIONS[@]}" "${BASE_PARTITIONS[@]}"; do
-    e2fsck -fy "$MERGED/${part}.img" 2>/dev/null || true
-done
-
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 7 — Pack super.img"
+step "PHASE 9 — Pack super.img"
 # ═════════════════════════════════════════════════════════════════════════════
 
 pack_super "$MERGED" "$OUT"
 
 # ═════════════════════════════════════════════════════════════════════════════
-step "PHASE 8 — Build flashable zip"
+step "PHASE 10 — Build flashable zip"
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Stage boot images
 for img in "${BASE_BOOT_IMAGES[@]}"; do
-    [[ -f "$MERGED/${img}.img" ]] && cp "$MERGED/${img}.img" "$OUT/"
+    [[ -f "$MERGED/${img}.img" ]] && cp "$MERGED/${img}.img" "$OUT/" || true
 done
 
+VERSION=$(get_version_string "$SOURCE_DUMP")
 build_flashable_zip "$OUT" "$OUT" "$VERSION"
 
 # ═════════════════════════════════════════════════════════════════════════════
-echo -e "\n${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${GREEN}${BOLD}  HyperOS_Port build complete!${RESET}"
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "\n${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "${GREEN}${BOLD}  Build complete!${RESET}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e "  Output: ${CYAN}$OUT/${RESET}"
 echo -e "  Zip:    ${CYAN}HyperOS_Port_lemonadep_${VERSION}.zip${RESET}"
-echo -e ""
-echo -e "${YELLOW}Flash instructions:${RESET}"
-echo -e "  1. Boot to fastboot: adb reboot fastboot"
-echo -e "  2. fastboot flash super output/super.img"
-echo -e "  3. fastboot flash boot output/boot.img"
-echo -e "  4. fastboot flash vendor_boot output/vendor_boot.img"
-echo -e "  5. fastboot flash dtbo output/dtbo.img"
-echo -e "  6. fastboot -w  (wipe userdata)"
-echo -e "  7. fastboot reboot"
-echo -e ""
-echo -e "${YELLOW}Or use TWRP/OrangeFox to sideload the zip.${RESET}"
+echo ""
+echo -e "${YELLOW}Flash via fastboot:${RESET}"
+echo "  adb reboot fastboot"
+echo "  fastboot flash super        output/super.img"
+echo "  fastboot flash boot         output/boot.img"
+echo "  fastboot flash vendor_boot  output/vendor_boot.img"
+echo "  fastboot flash dtbo         output/dtbo.img"
+echo "  fastboot -w && fastboot reboot"
+echo ""
+echo -e "${YELLOW}Or sideload the zip via TWRP/OrangeFox (wipe data first).${RESET}"
