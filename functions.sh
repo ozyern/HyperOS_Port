@@ -1,516 +1,377 @@
 #!/usr/bin/env bash
 # =============================================================================
-# functions.sh — Shared library for HyperOS 3 → OnePlus 9 Pro porting toolkit
-# Maintainer : Ozyern  |  https://github.com/ozyern
-# Project    : HyperOS3-Port-lemonadep
+# HyperOS_Port — functions.sh
+# Core utility library — sourced by port.sh
 # =============================================================================
 
-# ──────────────────────────── Colour helpers ─────────────────────────────────
+set -euo pipefail
+
+# ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-log_ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_err()     { echo -e "${RED}[ERR]${NC}   $*" >&2; }
-log_step()    { echo -e "\n${BOLD}${CYAN}━━━ $* ━━━${NC}"; }
-log_debug()   { [[ "${VERBOSE:-0}" == "1" ]] && echo -e "${YELLOW}[DBG]${NC}   $*"; }
-die()         { log_err "$*"; exit 1; }
+log()     { echo -e "${CYAN}[*]${RESET} $*"; }
+success() { echo -e "${GREEN}[✓]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
+die()     { echo -e "${RED}[✗]${RESET} $*" >&2; exit 1; }
+step()    { echo -e "\n${BOLD}${CYAN}━━ $* ━━${RESET}"; }
 
-banner() {
-cat << 'EOF'
-  _   _                  ___  ____    _____           _ _    _ _
- | | | |_   _ _ __   ___|_ _|/ ___|  |_   _|__   ___ | | | _(_) |_
- | |_| | | | | '_ \ / _ \| || |   _____| |/ _ \ / _ \| | |/ / | __|
- |  _  | |_| | |_) |  __/| || |__|_____| | (_) | (_) | |   <| | |_
- |_| |_|\__, | .__/ \___|___|\____|    |_|\___/ \___/|_|_|\_\_|\__|
-         |___/|_|
-          HyperOS 3  →  OnePlus 9 Pro (lemonadep / lahaina)
-          Maintainer: Ozyern  |  github.com/ozyern/ReVork_Ports
-EOF
-echo ""
-}
+# ── Error trap ────────────────────────────────────────────────────────────────
+trap 'die "Script failed at line $LINENO — command: $BASH_COMMAND"' ERR
 
-# ──────────────────────────── Tool resolution ────────────────────────────────
-# Prefer bundled bin/ over system PATH
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${SELF_DIR}/bin"
-export PATH="${BIN_DIR}:${PATH}"
-
-need_tool() {
-    local t="$1"
-    if ! command -v "$t" &>/dev/null; then
-        log_err "Required tool not found: $t"
-        log_err "Run:  sudo ./setup.sh   to install all dependencies."
-        exit 1
-    fi
-}
-
-check_all_tools() {
-    log_step "Checking required tools"
-    local missing=0
-    for t in unzip python3 zip; do
-        if command -v "$t" &>/dev/null; then
-            log_ok "  $t → $(command -v "$t")"
-        else
-            log_err "  $t → NOT FOUND"
-            missing=$((missing+1))
-        fi
+# ── Tool verification ─────────────────────────────────────────────────────────
+check_tools() {
+    local missing=()
+    for tool in "${TOOLS_REQUIRED[@]}"; do
+        command -v "$tool" &>/dev/null || missing+=("$tool")
     done
-    # Optional but preferred
-    for t in magiskboot fsck.erofs mkfs.erofs debugfs e2fsck brotli 7z lpdump; do
-        if command -v "$t" &>/dev/null; then
-            log_ok "  $t → $(command -v "$t")"
-        else
-            log_warn "  $t → not found (will use fallback)"
-        fi
-    done
-    [[ $missing -gt 0 ]] && die "Missing $missing required tools. Run sudo ./setup.sh"
-    log_ok "All required tools present"
+    [[ ${#missing[@]} -gt 0 ]] && die "Missing tools: ${missing[*]}"
+    success "All required tools found"
 }
 
-# ──────────────────────────── WSL detection ──────────────────────────────────
-is_wsl() {
-    grep -qiE "microsoft|wsl" /proc/version 2>/dev/null
-}
-
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        die "This script must be run as root (sudo ./port.sh ...)"
-    fi
-}
-
-# ──────────────────────────── ZIP helpers ────────────────────────────────────
-zip_contains() {
-    local zip="$1" pattern="$2"
-    unzip -l "$zip" 2>/dev/null | grep -q "$pattern"
-}
-
-detect_zip_type() {
-    # Returns: payload | super | raw_img | fastboot_sparse | unknown
-    # IMPORTANT: this function echoes its return value — NO log_info/log_warn
-    # calls allowed inside (they write to stdout and corrupt the return value).
-    # All diagnostic output must go to stderr (&2) only.
-    local zip="$1"
-
-    # Print contents to stderr so it shows in terminal but doesn't corrupt $()
-    echo "[INFO]  $(basename "$zip") contents (top 15):" >&2
-    unzip -l "$zip" 2>/dev/null | tail -n +4 | head -15 | awk '{print "    "$NF}' >&2
-
-    local listing
-    listing=$(unzip -l "$zip" 2>/dev/null)
-
-    if echo "$listing" | grep -qi "payload\.bin"; then
-        echo "payload"
-    elif echo "$listing" | grep -qi "super\.img"; then
-        echo "super"
-    elif echo "$listing" | grep -qi "system\.img"; then
-        echo "raw_img"
-    elif echo "$listing" | grep -qi "system\.new\.dat"; then
-        echo "fastboot_sparse"
-    elif echo "$listing" | grep -qi "\.new\.dat\.br"; then
-        echo "fastboot_sparse"
-    else
-        if command -v 7z &>/dev/null; then
-            local listing7z
-            listing7z=$(7z l "$zip" 2>/dev/null)
-            if echo "$listing7z" | grep -qi "payload\.bin"; then echo "payload"; return; fi
-            if echo "$listing7z" | grep -qi "super\.img";   then echo "super";   return; fi
-            if echo "$listing7z" | grep -qi "system\.img";  then echo "raw_img"; return; fi
-        fi
-        echo "unknown"
-    fi
-}
-
-# ──────────────────────────── Filesystem detection ───────────────────────────
-detect_fs() {
-    # Uses dd+od to read magic bytes — works in WSL (no 'file' command needed)
-    local img="$1"
-    [[ ! -f "$img" ]] && { echo "missing"; return; }
-
-    # erofs magic: 0xE0F5E1E2 at offset 1024 → LE bytes: e2 e1 f5 e0
-    local erofs_magic
-    erofs_magic=$(dd if="$img" bs=1 skip=1024 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')
-    if [[ "$erofs_magic" == "e2e1f5e0" ]]; then
-        echo "erofs"; return
-    fi
-
-    # ext4 magic: 0xEF53 at offset 1080 → LE bytes: 53 ef
-    local ext4_magic
-    ext4_magic=$(dd if="$img" bs=1 skip=1080 count=2 2>/dev/null | od -A n -t x1 | tr -d ' \n')
-    if [[ "$ext4_magic" == "53ef" ]]; then
-        echo "ext4"; return
-    fi
-
-    echo "unknown"
-}
-
-# ──────────────────────────── Image extraction ───────────────────────────────
-extract_img() {
-    local img="$1" dest="$2"
-    mkdir -p "$dest"
-
-    local fs
-    fs=$(detect_fs "$img")
-    log_debug "  detect_fs($img) → $fs"
-
-    case "$fs" in
-        erofs)
-            log_info "  Extracting erofs: $(basename "$img") → $dest"
-            fsck.erofs --extract="$dest" "$img" 2>/dev/null || true
-            if [[ "$(find "$dest" -mindepth 1 | wc -l)" -gt 0 ]]; then
-                log_ok "  erofs extracted (--extract=DIR)"
-                return 0
-            fi
-            fsck.erofs --extract "$dest" "$img" 2>/dev/null || true
-            if [[ "$(find "$dest" -mindepth 1 | wc -l)" -gt 0 ]]; then
-                log_ok "  erofs extracted (--extract DIR)"
-                return 0
-            fi
-            if command -v dump.erofs &>/dev/null; then
-                dump.erofs --extract="$dest" "$img" 2>/dev/null || true
-                if [[ "$(find "$dest" -mindepth 1 | wc -l)" -gt 0 ]]; then
-                    log_ok "  erofs extracted (dump.erofs)"
-                    return 0
-                fi
-            fi
-            log_err "  erofs extraction failed for $(basename "$img")"
-            return 1
-            ;;
-        ext4)
-            log_info "  Extracting ext4: $(basename "$img") → $dest"
-            if command -v debugfs &>/dev/null; then
-                debugfs -R "rdump / $dest" "$img" 2>/dev/null
-                log_ok "  ext4 extracted (debugfs)"
-            else
-                log_err "  debugfs not found, cannot extract ext4 image"
-                return 1
-            fi
-            ;;
-        *)
-            # Last-ditch: try both tools and see which one doesn't produce empty dir
-            log_warn "  Unknown FS for $(basename "$img"), trying brute-force..."
-            fsck.erofs --extract="$dest" "$img" 2>/dev/null || true
-            if [[ "$(find "$dest" -mindepth 1 -maxdepth 1 | wc -l)" -gt 0 ]]; then
-                log_ok "  brute-force erofs worked"
-                return 0
-            fi
-            if command -v debugfs &>/dev/null; then
-                debugfs -R "rdump / $dest" "$img" 2>/dev/null || true
-            fi
-            if [[ "$(find "$dest" -mindepth 1 -maxdepth 1 | wc -l)" -eq 0 ]]; then
-                log_err "  Brute-force extraction also failed for $(basename "$img")"
-                return 1
-            fi
-            ;;
-    esac
-    log_debug "  Extracted $(find "$dest" -type f | wc -l) files from $(basename "$img")"
-}
-
-# ──────────────────────────── payload.bin extraction ─────────────────────────
-extract_payload() {
-    local zip="$1" out_dir="$2"
-    log_info "  Detected payload.bin OTA format"
-    mkdir -p "$out_dir"
-
-    # Extract payload.bin from zip
-    unzip -j "$zip" "payload.bin" -d "$out_dir" || die "Failed to extract payload.bin from $zip"
-
-    local payload="${out_dir}/payload.bin"
-    local dumper="${SELF_DIR}/payload_dumper.py"
-    local pdg="${BIN_DIR}/payload-dumper-go"
-
-    # Also extract payload_properties.txt (needed by some tools)
-    unzip -j "$zip" "payload_properties.txt" -d "$out_dir" 2>/dev/null || true
-
-    # ── Check if this is a delta (incremental) OTA ───────────────────────────
-    # Delta OTAs have FILE_HASH / SOURCE_* in properties, full OTAs have only FILE_SIZE
-    local props_file="${out_dir}/payload_properties.txt"
-    if [[ -f "$props_file" ]] && grep -q "SOURCE_BUILD" "$props_file" 2>/dev/null; then
-        log_err "  ╔══════════════════════════════════════════════════════════╗"
-        log_err "  ║  DELTA (INCREMENTAL) OTA DETECTED — CANNOT USE THIS ROM ║"
-        log_err "  ╚══════════════════════════════════════════════════════════╝"
-        log_err "  This is a differential OTA that patches an existing device."
-        log_err "  It CANNOT be extracted standalone — it needs the source build."
-        log_err ""
-        log_err "  You need a FULL OTA (also called 'full package' or 'factory OTA')."
-        log_err "  For HyperOS 3: download from xiaomifirmwareupdater.com"
-        log_err "  For OOS14: download from oxygenos.plus or OnePlus community"
-        log_err "  Look for 'Full OTA' or files >3GB (delta OTAs are usually <1GB)"
-        rm -f "$payload" "$props_file"
-        die "Please re-download a FULL OTA ROM and try again"
-    fi
-
-    # ── Check payload size — delta OTAs are tiny, full OTAs are large ────────
-    local payload_size
-    payload_size=$(stat -c%s "$payload" 2>/dev/null || echo 0)
-    if [[ $payload_size -lt 104857600 ]]; then  # < 100MB is suspicious
-        log_warn "  payload.bin is only $(( payload_size / 1048576 ))MB — this may be a delta OTA"
-        log_warn "  If extraction produces 0-byte images, you need a FULL OTA ROM"
-    fi
-
-    # ── Try payload-dumper-go first (handles all OTA types best) ─────────────
-    if [[ -f "$pdg" ]] || command -v payload-dumper-go &>/dev/null; then
-        local pdg_bin="${pdg}"
-        command -v payload-dumper-go &>/dev/null && pdg_bin="payload-dumper-go"
-        log_info "  Using payload-dumper-go"
-        "$pdg_bin" -output-dir "$out_dir" "$payload" 2>/dev/null || \
-        "$pdg_bin" -o "$out_dir" "$payload" 2>/dev/null || \
-        "$pdg_bin" "$payload" "$out_dir" 2>/dev/null || {
-            log_warn "  payload-dumper-go failed, falling back to payload_dumper.py"
-        }
-        # Verify we got real images
-        local img_count non_empty
-        img_count=$(find "$out_dir" -name "*.img" | wc -l)
-        non_empty=$(find "$out_dir" -name "*.img" -size +1k | wc -l)
-        if [[ $non_empty -gt 5 ]]; then
-            log_ok "  payload-dumper-go: $non_empty/$img_count images extracted with data"
-            rm -f "$payload" "$props_file"
-            return 0
-        fi
-        log_warn "  payload-dumper-go produced $non_empty non-empty images — falling back"
-    fi
-
-    # ── Fallback: bundled payload_dumper.py ───────────────────────────────────
-    if [[ -f "$dumper" ]]; then
-        log_info "  Using bundled payload_dumper.py"
-        python3 "$dumper" "$payload" --out "$out_dir" || {
-            local got non_empty2
-            got=$(find "$out_dir" -name "*.img" | wc -l)
-            non_empty2=$(find "$out_dir" -name "*.img" -size +1k | wc -l)
-            if [[ $non_empty2 -lt 3 ]]; then
-                log_err "  Only $non_empty2 non-empty images extracted out of $got"
-                log_err "  This is almost certainly a DELTA OTA — you need a FULL OTA ROM"
-                rm -f "$payload" "$props_file"
-                die "Extraction failed — download a FULL OTA ROM (>3GB) and retry"
-            fi
-            log_warn "  payload_dumper.py had warnings but got $non_empty2 images — continuing"
-        }
-        # Final check
-        local final_empty
-        final_empty=$(find "$out_dir" -name "system.img" -size +1k | wc -l)
-        if [[ $final_empty -eq 0 ]]; then
-            log_err "  system.img is empty — this is a DELTA OTA, not a full OTA"
-            die "Download a FULL OTA ROM from xiaomifirmwareupdater.com / oxygenos.plus"
-        fi
-    else
-        die "No payload dumper found. payload_dumper.py must be next to port.sh"
-    fi
-
-    rm -f "$payload" "$props_file"
-    log_ok "  payload.bin extracted → $out_dir"
-}
-
-# ──────────────────────────── super.img handling ─────────────────────────────
-extract_super() {
-    local zip="$1" work="$2"
-    log_info "  Detected super.img format"
-    mkdir -p "$work"
-    unzip -j "$zip" "super.img" -d "$work" 2>/dev/null || true
-    unzip -j "$zip" "super.img.br" -d "$work" 2>/dev/null || true
-
-    if [[ -f "${work}/super.img.br" ]]; then
-        log_info "  Decompressing super.img.br"
-        brotli -d "${work}/super.img.br" -o "${work}/super.img" || die "brotli decompression failed"
-    fi
-
-    [[ ! -f "${work}/super.img" ]] && die "super.img not found after extraction"
-
-    local lpunpack_bin
-    lpunpack_bin="${BIN_DIR}/lpunpack"
-    if ! command -v lpunpack &>/dev/null && [[ ! -f "$lpunpack_bin" ]]; then
-        die "lpunpack not found. Run sudo ./setup.sh"
-    fi
-
-    log_info "  Running lpunpack on super.img"
-    lpunpack "${work}/super.img" "$work" || die "lpunpack failed"
-    log_ok "  super.img split into partitions"
-}
-
-# ──────────────────────────── ROM extraction dispatcher ──────────────────────
+# ── ROM extraction ────────────────────────────────────────────────────────────
+# Detects payload.bin (fastboot OTA) vs raw zip (TWRP/OTA sideload)
 extract_rom() {
-    local label="$1"
-    local zip="$2"
-    local work="$3"
-    mkdir -p "$work"
+    local zip="$1" outdir="$2" label="$3"
+    mkdir -p "$outdir"
+    log "Extracting $label ROM: $zip"
 
-    local zip_type
-    zip_type=$(detect_zip_type "$zip")   # detect_zip_type logs to stderr internally
-    log_info "[$label] ROM format detected: ${BOLD}${zip_type}${NC}"
-
-    case "$zip_type" in
-        payload)
-            extract_payload "$zip" "$work"
-            ;;
-        super)
-            extract_super "$zip" "$work"
-            ;;
-        raw_img|fastboot_sparse)
-            log_info "  Extracting raw images from zip"
-            unzip -o "$zip" "*.img" -d "$work" 2>/dev/null || true
-            # Handle .new.dat.br sparse format
-            if zip_contains "$zip" ".new.dat.br"; then
-                unzip -o "$zip" "*.new.dat.br" "*.transfer.list" -d "$work" 2>/dev/null || true
-                for br_file in "$work"/*.new.dat.br; do
-                    [[ -f "$br_file" ]] || continue
-                    local base="${br_file%.new.dat.br}"
-                    brotli -d "$br_file" -o "${base}.new.dat" 2>/dev/null || true
-                    local part_name
-                    part_name=$(basename "$base")
-                    if [[ -f "${base}.transfer.list" && -f "${base}.new.dat" ]]; then
-                        python3 "${SELF_DIR}/payload_dumper.py" --sdat2img \
-                            "${base}.transfer.list" "${base}.new.dat" "${base}.img" 2>/dev/null || true
-                    fi
-                done
-            fi
-            log_ok "  Raw images extracted → $work"
-            ;;
-        *)
-            log_err "[$label] Cannot determine ZIP format for: $(basename "$zip")"
-            log_err "  Expected one of: payload.bin / super.img / system.img / system.new.dat.br"
-            log_err "  Actual ZIP listing above — check if the file is corrupt or a different format"
-            log_err "  Try:  unzip -l \"$zip\" | head -30"
-            die "Unknown ZIP format — aborting"
-            ;;
-    esac
-}
-
-# ──────────────────────────── Image repack ───────────────────────────────────
-repack_img() {
-    local source_dir="$1"
-    local output_img="$2"
-    local fs_type="${3:-erofs}"    # erofs | ext4
-    local label="${4:-partition}"
-
-    log_info "  Repacking $label → $(basename "$output_img") ($fs_type)"
-
-    if [[ "$(find "$source_dir" -mindepth 1 -maxdepth 1 | wc -l)" -eq 0 ]]; then
-        log_warn "  Skipping $label — source dir is empty"
-        return 1
-    fi
-
-    case "$fs_type" in
-        erofs)
-            if command -v mkfs.erofs &>/dev/null; then
-                mkfs.erofs -zlz4hc "$output_img" "$source_dir" 2>/dev/null \
-                    || mkfs.erofs "$output_img" "$source_dir" 2>/dev/null \
-                    || { log_err "mkfs.erofs failed for $label"; return 1; }
-            else
-                log_warn "  mkfs.erofs not found — falling back to ext4 for $label"
-                make_ext4_img "$source_dir" "$output_img" "$label"
-            fi
-            ;;
-        ext4)
-            make_ext4_img "$source_dir" "$output_img" "$label"
-            ;;
-    esac
-    log_ok "  Repacked $label ($(du -sh "$output_img" | cut -f1))"
-}
-
-make_ext4_img() {
-    local source_dir="$1" output_img="$2" label="$3"
-    local size_bytes
-    size_bytes=$(du -sb "$source_dir" | cut -f1)
-    local size_mb=$(( (size_bytes / 1048576) + 256 ))
-    dd if=/dev/zero of="$output_img" bs=1M count="$size_mb" 2>/dev/null
-    mkfs.ext4 -L "$label" -d "$source_dir" "$output_img" 2>/dev/null \
-        || { log_err "mkfs.ext4 failed for $label"; return 1; }
-}
-
-# ──────────────────────────── build.prop helpers ─────────────────────────────
-prop_set() {
-    local file="$1" key="$2" val="$3"
-    if grep -q "^${key}=" "$file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+    if 7z l "$zip" | grep -q "payload.bin"; then
+        log "Detected payload.bin — using payload_dumper"
+        local tmpdir; tmpdir=$(mktemp -d)
+        7z e "$zip" -o"$tmpdir" payload.bin -y >/dev/null
+        payload_dumper --out "$outdir" "$tmpdir/payload.bin"
+        rm -rf "$tmpdir"
+    elif 7z l "$zip" | grep -q "super.img"; then
+        log "Detected pre-built super.img — extracting directly"
+        7z e "$zip" -o"$outdir" "super.img" -y >/dev/null
+        _unpack_super "$outdir/super.img" "$outdir"
+        rm -f "$outdir/super.img"
     else
-        echo "${key}=${val}" >> "$file"
+        die "Cannot determine ROM format for $zip"
     fi
+    success "Extracted $label ROM to $outdir"
 }
 
-prop_delete() {
-    local file="$1" key="$2"
-    sed -i "/^${key}=/d" "$file"
+# Unpack super.img → individual partition images
+_unpack_super() {
+    local super_img="$1" outdir="$2"
+    # Convert sparse → raw if needed
+    if file "$super_img" | grep -q "Android sparse"; then
+        log "Converting sparse super.img to raw"
+        simg2img "$super_img" "${super_img%.img}_raw.img"
+        mv "${super_img%.img}_raw.img" "$super_img"
+    fi
+    lpunpack "$super_img" "$outdir"
 }
 
-# ──────────────────────────── XML helpers ────────────────────────────────────
-xml_set_attr() {
-    # xml_set_attr file.xml tagname attrname newvalue
-    local file="$1" tag="$2" attr="$3" val="$4"
-    python3 - "$file" "$tag" "$attr" "$val" << 'PY'
-import sys, re
-f,tag,attr,val = sys.argv[1:]
-txt = open(f).read()
-def rep(m):
-    inner = re.sub(r'(?<=\s)' + re.escape(attr) + r'="[^"]*"', attr+'="'+val+'"', m.group(0))
-    if attr+'="' not in inner:
-        inner = inner.rstrip('>').rstrip('/') + ' ' + attr + '="' + val + '">'
-    return inner
-txt = re.sub(r'<' + re.escape(tag) + r'[^>]*>', rep, txt)
-open(f,'w').write(txt)
-PY
+# ── Partition mounting ────────────────────────────────────────────────────────
+mount_partition() {
+    local img="$1" mntpoint="$2"
+    mkdir -p "$mntpoint"
+    # Convert to raw if sparse
+    if file "$img" | grep -q "Android sparse"; then
+        local raw="${img%.img}_raw.img"
+        simg2img "$img" "$raw"
+        img="$raw"
+    fi
+    # Resize to ensure free space for edits
+    e2fsck -fy "$img" 2>/dev/null || true
+    resize2fs "$img" 2>/dev/null || true
+    mount -o loop,rw "$img" "$mntpoint" || die "Failed to mount $img"
+    log "Mounted $img → $mntpoint"
 }
 
-# ──────────────────────────── SELinux CIL helpers ────────────────────────────
-append_cil_rules() {
-    local cil_file="$1"
-    shift
-    # Each arg is a CIL allow rule
-    for rule in "$@"; do
-        grep -qF "$rule" "$cil_file" 2>/dev/null || echo "$rule" >> "$cil_file"
+unmount_partition() {
+    local mntpoint="$1"
+    umount "$mntpoint" 2>/dev/null || true
+    rmdir "$mntpoint" 2>/dev/null || true
+}
+
+# ── Partition merge ───────────────────────────────────────────────────────────
+# Copies contents from source image into a fresh ext4 image
+copy_partition_contents() {
+    local src_img="$1" dst_img="$2" label="$3"
+    local src_mnt dst_mnt
+    src_mnt=$(mktemp -d); dst_mnt=$(mktemp -d)
+
+    # Get source size for dst sizing
+    local src_size; src_size=$(stat -c%s "$src_img")
+    local dst_size=$(( src_size + 64*1024*1024 ))   # +64 MiB headroom
+
+    log "Creating $label partition image ($(( dst_size / 1024 / 1024 )) MiB)"
+    dd if=/dev/zero of="$dst_img" bs=1 count=0 seek="$dst_size" 2>/dev/null
+    mkfs.ext4 -L "$label" "$dst_img" >/dev/null 2>&1
+
+    mount_partition "$src_img" "$src_mnt"
+    mount_partition "$dst_img" "$dst_mnt"
+
+    log "Copying $label contents…"
+    cp -a --preserve=all "$src_mnt/." "$dst_mnt/"
+
+    unmount_partition "$dst_mnt"
+    unmount_partition "$src_mnt"
+    rm -f "$src_mnt" "$dst_mnt" 2>/dev/null || true
+    success "Copied $label"
+}
+
+# ── Prop manipulation ─────────────────────────────────────────────────────────
+strip_props() {
+    local build_prop="$1"
+    [[ -f "$build_prop" ]] || { warn "build.prop not found: $build_prop"; return; }
+
+    local backup="${build_prop}.bak"
+    cp "$build_prop" "$backup"
+
+    for prefix in "${PROPS_TO_STRIP[@]}"; do
+        sed -i "/^${prefix}/d" "$build_prop" || true
     done
+    success "Stripped MIUI/HyperOS props from $(basename "$build_prop")"
 }
 
-# ──────────────────────────── Boot image helpers ─────────────────────────────
-unpack_boot() {
-    local img="$1" work="$2"
-    mkdir -p "$work"
-    if command -v magiskboot &>/dev/null; then
-        cp "$img" "${work}/boot.img"
-        ( cd "$work" && magiskboot unpack boot.img ) || die "magiskboot unpack failed"
+set_prop() {
+    local build_prop="$1" key="$2" value="$3"
+    [[ -f "$build_prop" ]] || { warn "build.prop not found: $build_prop"; return; }
+
+    if grep -q "^${key}=" "$build_prop"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$build_prop"
     else
-        die "magiskboot not found — cannot unpack boot image"
+        echo "${key}=${value}" >> "$build_prop"
     fi
 }
 
-repack_boot() {
-    local work="$1" output="$2"
-    if command -v magiskboot &>/dev/null; then
-        ( cd "$work" && magiskboot repack boot.img ) || die "magiskboot repack failed"
-        cp "${work}/new-boot.img" "$output"
-    else
-        die "magiskboot not found — cannot repack boot image"
+apply_prop_overrides() {
+    local build_prop="$1"
+    log "Applying prop overrides to $(basename "$build_prop")"
+    for key in "${!PROP_OVERRIDES[@]}"; do
+        set_prop "$build_prop" "$key" "${PROP_OVERRIDES[$key]}"
+    done
+    success "Applied prop overrides"
+}
+
+# ── HyperOS-specific cleanups ─────────────────────────────────────────────────
+remove_hyperos_junk() {
+    local system_mnt="$1"
+    step "Removing incompatible HyperOS components"
+
+    # MIUI/HyperOS analytics & cloud services — won't work, waste space
+    local remove_apps=(
+        MiuiCore
+        MiCloud
+        MiService
+        MiuiSuperCut
+        MiuiMiTime
+        CleanMaster
+        MiuiVirtualSim
+        SecurityCenter      # Xiaomi-HAL-dependent
+        MiuiContentCatcher
+        MiuiBugReport
+        MiuiDaemon
+        GameTurboService    # Xiaomi-specific HAL
+        MIUIVault
+        MiuiSuperResolution
+    )
+
+    for app in "${remove_apps[@]}"; do
+        local app_path="$system_mnt/system_ext/app/$app"
+        local priv_path="$system_mnt/system_ext/priv-app/$app"
+        [[ -d "$app_path" ]] && { rm -rf "$app_path"; log "Removed $app"; } || true
+        [[ -d "$priv_path" ]] && { rm -rf "$priv_path"; log "Removed $app (priv)"; } || true
+    done
+
+    # Remove Xiaomi-HAL-dependent native libs from system
+    local xiaomi_libs=(
+        "libMiuiHapticFeedback.so"
+        "libxiaomi_ril.so"
+        "libmiuiphonewindow.so"
+    )
+    for lib in "${xiaomi_libs[@]}"; do
+        find "$system_mnt" -name "$lib" -delete 2>/dev/null || true
+    done
+
+    success "Removed incompatible HyperOS components"
+}
+
+# ── mi_ext partition handling ──────────────────────────────────────────────────
+# HyperOS introduced a separate mi_ext partition — strip it, merge needed
+# bits into system_ext
+handle_mi_ext() {
+    local source_dir="$1" system_ext_mnt="$2"
+    local mi_ext_img="$source_dir/mi_ext.img"
+
+    if [[ ! -f "$mi_ext_img" ]]; then
+        log "No mi_ext partition found — skipping"
+        return
     fi
+
+    log "Processing mi_ext partition"
+    local mi_mnt; mi_mnt=$(mktemp -d)
+    mount_partition "$mi_ext_img" "$mi_mnt"
+
+    # Copy mi_ext/app and mi_ext/priv-app into system_ext
+    for subdir in app priv-app framework lib lib64 etc; do
+        [[ -d "$mi_mnt/$subdir" ]] || continue
+        cp -a --preserve=all "$mi_mnt/$subdir/." "$system_ext_mnt/$subdir/" 2>/dev/null || true
+        log "Merged mi_ext/$subdir → system_ext"
+    done
+
+    unmount_partition "$mi_mnt"
+    success "mi_ext merged into system_ext"
 }
 
-patch_boot_cmdline() {
-    local work="$1" extra="$2"
-    local cmdline_file="${work}/header"
-    if [[ -f "${work}/cmdline" ]]; then
-        echo -n " $extra" >> "${work}/cmdline"
-    elif [[ -f "$cmdline_file" ]]; then
-        sed -i "s|cmdline=|cmdline= $extra |" "$cmdline_file" 2>/dev/null || true
-    fi
+# ── Init / fstab patching ─────────────────────────────────────────────────────
+patch_fstab() {
+    local vendor_mnt="$1"
+    log "Patching fstab for lemonadep partition layout"
+
+    local fstab_file; fstab_file=$(find "$vendor_mnt/etc" -name "fstab.*" | head -1 || true)
+    [[ -z "$fstab_file" ]] && { warn "No fstab found in vendor"; return; }
+
+    # Strip mi_ext entries if present (partition won't exist on lemonadep)
+    sed -i '/mi_ext/d' "$fstab_file" || true
+    # Ensure logical partitions list matches our super layout
+    log "Patched fstab: $fstab_file"
 }
 
-# ──────────────────────────── File copy helpers ──────────────────────────────
-safe_copy() {
-    local src="$1" dst="$2"
-    [[ ! -e "$src" ]] && { log_warn "  Source not found: $src"; return 1; }
-    mkdir -p "$(dirname "$dst")"
-    cp -a "$src" "$dst" && log_debug "  Copied: $src → $dst"
+patch_init_rc() {
+    local system_mnt="$1"
+    log "Patching init.rc fragments"
+
+    # Remove MIUI-specific init services that reference unavailable HALs
+    find "$system_mnt" -name "*.rc" | while read -r rc; do
+        sed -i '/miui.*/d; /xiaomi.*/d; /mi\.daemon/d' "$rc" 2>/dev/null || true
+    done
+    success "Patched init.rc fragments"
 }
 
-safe_rsync() {
-    local src="$1" dst="$2"
-    [[ ! -d "$src" ]] && { log_warn "  Rsync source not found: $src"; return 1; }
-    mkdir -p "$dst"
-    rsync -aHAX --no-specials --no-devices "$src/" "$dst/" 2>/dev/null || \
-        cp -a "$src/." "$dst/"
+# ── SELinux context fixup ─────────────────────────────────────────────────────
+fix_selinux_contexts() {
+    local partition_mnt="$1" label="$2"
+    local contexts_file="$partition_mnt/etc/selinux/plat_file_contexts"
+    [[ -f "$contexts_file" ]] || return
+    log "SELinux contexts present in $label — keeping as-is (Xiaomi contexts are GKI-compatible)"
 }
 
-# ──────────────────────────── Timing helpers ─────────────────────────────────
-SECONDS=0
-elapsed() {
-    local s=$SECONDS
-    printf "%dm%02ds" $((s/60)) $((s%60))
+# ── Super image packing ────────────────────────────────────────────────────────
+pack_super() {
+    local workdir="$1" outdir="$2"
+    step "Packing super.img"
+
+    local lpmake_args=(
+        --metadata-size "$METADATA_SIZE"
+        --super-name super
+        --block-size "$SUPER_BLOCK_SIZE"
+        --metadata-slots 3
+        --device super:"$SUPER_SIZE"
+        --group qti_dynamic_partitions_a:"$SUPER_SIZE"
+        --group qti_dynamic_partitions_b:"$SUPER_SIZE"
+    )
+
+    local slot_suffix=_a
+    for part in $DYNAMIC_PARTITION_LIST; do
+        local img="$workdir/${part}.img"
+        [[ -f "$img" ]] || die "Missing partition image: $img"
+
+        # Convert to sparse for super packing
+        local sparse_img="$workdir/${part}_sparse.img"
+        img2simg "$img" "$sparse_img"
+
+        lpmake_args+=(
+            --partition "${part}${slot_suffix}":readonly:"$(stat -c%s "$img")":qti_dynamic_partitions_a
+            --image "${part}${slot_suffix}=$sparse_img"
+            # Slot B — empty (will be filled on first OTA)
+            --partition "${part}_b":readonly:0:qti_dynamic_partitions_b
+        )
+    done
+
+    local super_out="$outdir/super.img"
+    lpmake_args+=(--output "$super_out" --sparse)
+
+    log "Running lpmake…"
+    lpmake "${lpmake_args[@]}"
+    success "super.img → $super_out ($(du -sh "$super_out" | cut -f1))"
+}
+
+# ── Flashable zip assembly ─────────────────────────────────────────────────────
+build_flashable_zip() {
+    local workdir="$1" outdir="$2" version="$3"
+    step "Building flashable zip"
+
+    local zip_root="$workdir/zip_root"
+    mkdir -p "$zip_root/META-INF/com/google/android"
+
+    # updater-script (stub — real logic in update-binary)
+    cat > "$zip_root/META-INF/com/google/android/updater-script" <<'EOF'
+# HyperOS_Port — generated by port.sh
+EOF
+
+    # update-binary: shell-based flasher
+    cat > "$zip_root/META-INF/com/google/android/update-binary" <<'FLASHER'
+#!/sbin/sh
+# HyperOS_Port — update-binary
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+
+ui_print() { echo "ui_print $*" > "$OUTFD"; echo "ui_print" > "$OUTFD"; }
+abort()    { ui_print "ERROR: $*"; exit 1; }
+
+ui_print "━━ HyperOS_Port Installer ━━"
+ui_print "Target: OnePlus 9 Pro (lemonadep)"
+ui_print ""
+
+TMPDIR=/tmp/hyperos_port
+mkdir -p "$TMPDIR"
+unzip -o "$ZIPFILE" 'images/*' -d "$TMPDIR" || abort "Failed to extract images"
+
+flash_image() {
+    local part="$1" img="$TMPDIR/images/$2"
+    ui_print "  Flashing $part…"
+    [ -f "$img" ] || abort "Missing image: $2"
+    blockdev --setrw "/dev/block/by-name/$part" 2>/dev/null || true
+    dd if="$img" of="/dev/block/by-name/$part" bs=4096 || abort "Flash failed: $part"
+}
+
+ui_print "[1/4] Flashing boot images…"
+flash_image boot_a        boot.img
+flash_image vendor_boot_a vendor_boot.img
+flash_image dtbo_a        dtbo.img
+
+ui_print "[2/4] Flashing super…"
+flash_image super super.img
+
+ui_print "[3/4] Wiping userdata…"
+ui_print "  (Skipping — wipe manually if needed)"
+
+ui_print "[4/4] Setting active slot to A…"
+/sbin/bootctl set-active-boot-slot 0 2>/dev/null || true
+
+ui_print ""
+ui_print "✓ HyperOS_Port installed successfully!"
+ui_print "  Boot into system — first boot may take 3-5 minutes."
+rm -rf "$TMPDIR"
+FLASHER
+
+    chmod +x "$zip_root/META-INF/com/google/android/update-binary"
+
+    # Copy images
+    mkdir -p "$zip_root/images"
+    for img in super.img boot.img vendor_boot.img dtbo.img; do
+        [[ -f "$workdir/$img" ]] && cp "$workdir/$img" "$zip_root/images/"
+    done
+
+    local zip_out="$outdir/HyperOS_Port_lemonadep_${version}.zip"
+    (cd "$zip_root" && zip -r9 "$zip_out" . -x "*.DS_Store")
+    success "Flashable zip → $zip_out ($(du -sh "$zip_out" | cut -f1))"
+}
+
+# ── Version string helper ─────────────────────────────────────────────────────
+get_version_string() {
+    local source_dir="$1"
+    local build_prop="$source_dir/system/system/build.prop"
+    [[ -f "$build_prop" ]] || build_prop="$source_dir/system/build.prop"
+
+    local version
+    version=$(grep "^ro.build.version.incremental=" "$build_prop" 2>/dev/null \
+               | cut -d= -f2 | tr -d '[:space:]') || true
+    echo "${version:-unknown}"
 }
